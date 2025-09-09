@@ -55,6 +55,10 @@ FREE_FORM_LIST = [
 TASK_TYPE = 'task_type'
 SUBSET_LIST = MULTIPLE_CHOICE_LIST + FREE_FORM_LIST
 
+PROMPT_TEMPLATE = """
+Q: {question}
+A: Let's think step by step. Put your final answer in the format of "So the answer is $ANSWER" (without quotes and markdown) where $ANSWER is the answer to the problem.
+""".lstrip()  # noqa: E501
 
 @Benchmark.register(
     name='bbh',
@@ -65,7 +69,7 @@ SUBSET_LIST = MULTIPLE_CHOICE_LIST + FREE_FORM_LIST
     few_shot_num=3,
     train_split=None,
     eval_split='test',
-    prompt_template="Q: {query}\nA: Let's think step by step.",
+    prompt_template=PROMPT_TEMPLATE,
 )
 class BBHAdapter(DataAdapter):
     """
@@ -121,7 +125,7 @@ class BBHAdapter(DataAdapter):
             cot_prompts = 'Follow the given examples and answer the question.\n' + few_shot_list[0]
         else:
             cot_prompts = ''
-        full_prompt = cot_prompts + self.prompt_template.format(query=input_d['input'])
+        full_prompt = cot_prompts + self.prompt_template.format(question=input_d['input'])
 
         return self.gen_prompt_data(full_prompt)
 
@@ -210,35 +214,61 @@ class BBHAdapter(DataAdapter):
     @classmethod
     def _extract_mc_answer(cls, ans: str) -> str:
         """
-        Extract the answer from the model output for Multiple choice task.
+        Extract normalized answer for BBH multiple-choice tasks.
+        Handles formats like:
+        - "answer is (A)"
+        - "The answer is A."
+        - Extra text after answer.
         """
-        ans_line = ans.split('answer is ')
-        if len(ans_line) != 1:
-            ans = ans_line[1].strip()
-        match = re.search(r'\(([A-Z])\)*', ans)
+        ans = ans.strip()
+
+        # 优先按 "answer is " 分割
+        parts = ans.split('So the answer is ')
+        if len(parts) > 1:
+            ans = parts[1].strip()
+
+        # 捕捉括号内的大写字母 (A) (B) ...
+        match = re.search(r'\(([A-Z])\)', ans)
         if match:
             return match.group(1)
-        match = re.search(r'([A-Z])', ans)
+
+        # 捕捉单个大写字母
+        match = re.search(r'\b([A-Z])\b', ans)
         if match:
             return match.group(1)
+
         return ans
 
     @classmethod
     def _extract_ff_answer(cls, ans: str):
         """
-        Extract the answer from the model output for Free-form task.
+        Extract the normalized answer for BBH free-form tasks.
+        Handles patterns like:
+        - "answer is XXX."
+        - "The answer is **valid**."
+        - Extra trailing dots / line breaks.
+        - Bold-marked answers (**xxx**).
         """
-        pattern = r'answer is\s+(.*?)\.'
+        ans = ans.strip()
 
-        match = re.search(pattern, ans)
+        # 尝试优先用正则捕捉 "answer is xxx." 形式
+        match = re.search(r'So the answer is\s+([^\n\.]+)', ans, flags=re.IGNORECASE)
         if match:
-            res = match.group(1)
-            return res
+            ans = match.group(1).strip()
+        else:
+            # fallback: 按 "answer is " 分割
+            parts = ans.split('So the answer is ')
+            if len(parts) > 1:
+                ans = parts[1].strip()
+            ans = ans.split('\n')[0].strip()
 
-        ans_line = ans.split('answer is ')
-        if len(ans_line) != 1:
-            ans = ans_line[1].strip()
-        ans = ans.split('\n')[0]
+        # 去掉末尾句号
         if ans.endswith('.'):
-            ans = ans[:-1]
+            ans = ans[:-1].strip()
+
+        # 如果有 **xxx** 的形式，优先取里面的内容
+        match = re.search(r'\*\*(.*?)\*\*', ans)
+        if match:
+            ans = match.group(1).strip()
+
         return ans
