@@ -219,13 +219,18 @@ class BBHAdapter(DataAdapter):
         - "answer is (A)"
         - "The answer is A."
         - Extra text after answer.
+        Always uses the *last* occurrence of "answer is".
         """
         ans = ans.strip()
 
-        # 优先按 "answer is " 分割
         parts = ans.split('So the answer is ')
         if len(parts) > 1:
-            ans = parts[1].strip()
+            ans = parts[-1].strip()
+        ans = ans.split('\n')[0].strip()
+
+        # 去掉末尾句号
+        if ans.endswith('.'):
+            ans = ans[:-1].strip()
 
         # 捕捉括号内的大写字母 (A) (B) ...
         match = re.search(r'\(([A-Z])\)', ans)
@@ -248,19 +253,14 @@ class BBHAdapter(DataAdapter):
         - "The answer is **valid**."
         - Extra trailing dots / line breaks.
         - Bold-marked answers (**xxx**).
+        Always uses the *last* occurrence of "answer is".
         """
         ans = ans.strip()
 
-        # 尝试优先用正则捕捉 "answer is xxx." 形式
-        match = re.search(r'So the answer is\s+([^\n\.]+)', ans, flags=re.IGNORECASE)
-        if match:
-            ans = match.group(1).strip()
-        else:
-            # fallback: 按 "answer is " 分割
-            parts = ans.split('So the answer is ')
-            if len(parts) > 1:
-                ans = parts[1].strip()
-            ans = ans.split('\n')[0].strip()
+        parts = ans.split('So the answer is ')
+        if len(parts) > 1:
+            ans = parts[-1].strip()
+        ans = ans.split('\n')[0].strip()
 
         # 去掉末尾句号
         if ans.endswith('.'):
