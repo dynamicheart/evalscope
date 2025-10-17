@@ -1,10 +1,15 @@
 import os
 import re
+import requests
+import time
+import random
+import json
 from typing import Any, Dict, List, Optional
 
 from evalscope.api.messages import ChatMessage, ChatMessageSystem, ChatMessageUser
 from evalscope.constants import JudgeScoreType
 from evalscope.utils.logger import get_logger
+import threading
 
 logger = get_logger()
 
@@ -43,6 +48,33 @@ DEFAULT_JUDGE_MODEL = 'Qwen/Qwen3-235B-A22B'
 DEFAULT_API_URL = 'https://api-inference.modelscope.cn/v1/'
 
 
+class RateLimiter:
+    """Global rate limiter for multi-thread environment."""
+    def __init__(self, rate_per_sec):
+        """
+        rate_per_sec: allowed requests per second (global)
+        """
+        self.rate = rate_per_sec
+        self.allowance = rate_per_sec  # 当前可用额度
+        self.last_check = time.time()
+        self.lock = threading.Lock()
+
+    def acquire(self):
+        """Block until allowed to send a request"""
+        while True:
+            with self.lock:
+                current = time.time()
+                elapsed = current - self.last_check
+                self.last_check = current
+                self.allowance += elapsed * self.rate
+                if self.allowance > self.rate:
+                    self.allowance = self.rate
+
+                if self.allowance >= 1.0:
+                    self.allowance -= 1.0
+                    return  # allowed
+            time.sleep(0.01)  # sleep 10ms and retry
+
 class LLMJudge:
     """
     A metric that uses LLM to judge the quality of model predictions by comparing them with reference answers.
@@ -78,10 +110,16 @@ class LLMJudge:
                 - 'numeric': Treat the extracted value as a direct numerical score
         """
         self.api_key = api_key or os.environ.get('MODELSCOPE_SDK_TOKEN', 'EMPTY')
+        self.api_key_list = self.api_key.split(',')
+        self.api_key = self.api_key_list[0]
+        self.rate_limiter = RateLimiter(rate_per_sec=5)
+        self.key_lock = threading.Lock()
+        self.key_cooldown = {key: 0 for key in self.api_key_list}  # 冷却时间戳
+
         self.api_url = api_url or os.environ.get('MODELSCOPE_API_BASE', DEFAULT_API_URL)
         self.model_id = model_id or os.environ.get('MODELSCOPE_JUDGE_LLM', DEFAULT_JUDGE_MODEL)
         self.system_prompt = system_prompt or os.environ.get('JUDGE_SYSTEM_PROMPT', None)
-        self.generation_config = generation_config or {'temperature': 0.0, 'max_tokens': 1024}
+        self.generation_config = generation_config or {'temperature': 0.001, 'max_tokens': 1024}
 
         # Default score mapping for A/B pattern
         self.score_type = score_type
@@ -110,6 +148,90 @@ class LLMJudge:
             config=GenerateConfig(**self.generation_config),
         )
 
+    def _get_available_key(self):
+        """Select an available API key (not in cooldown)."""
+        while True:
+            with self.key_lock:
+                now = time.time()
+                valid_keys = [k for k in self.api_key_list if now >= self.key_cooldown[k]]
+                if valid_keys:
+                    return random.choice(valid_keys)
+            sleep_time = random.uniform(5, 10)
+            logger.warning(f"All API keys cooling down, wait {sleep_time:.1f}s...")
+            time.sleep(sleep_time)
+
+    def ernie_judge(
+        self,
+        prompt: str = '',
+        system_prompt: Optional[str] = None,
+        messages: Optional[List[ChatMessage]] = None
+    ) -> str:
+        """
+        Generate a response from the LLM based on the provided prompt and context.
+        If messages is provided, it will be used as the input context.
+
+        Args:
+            prompt (str): The prompt to evaluate
+            system_prompt (str, optional): The system prompt to use for the evaluation
+            messages (List[ChatMessage], optional): A list of chat messages to include in the evaluation
+        Returns:
+            str: The response from the LLM
+        """
+        # 构造 messages
+        if messages is not None:
+            input_messages = messages
+            assert False, "ChatMessage not implemented yet for ernie judge"
+        else:
+            system_content = system_prompt or self.system_prompt
+            input_messages = [{"role": "user", "content": prompt}]
+            if system_content:
+                input_messages.insert(0, {"role": "system", "content": system_content})
+
+        # 请求体
+        payload = {
+            "model": self.model_id,
+            "temperature": self.generation_config.get("temperature", 0.001),
+            "max_tokens": self.generation_config.get("max_tokens", 1024),
+            "stream": False,
+            "safety_level": "none",
+            "messages": input_messages
+        }
+
+        # 随机选择一个api_key
+        max_retries = 5
+        for attempt in range(max_retries):
+            self.rate_limiter.acquire()  # global rate limit
+            api_key = self._get_available_key()
+            try:
+                headers = {"Content-Type": "application/json"}
+                url = f"{self.api_url}?access_token={api_key}"
+                resp = requests.post(url, headers=headers, data=json.dumps(payload), timeout=600)
+
+                if resp.status_code != 200:
+                    logger.error(f"[{attempt+1}/{max_retries}] HTTP {resp.status_code}: {resp.text}")
+                    continue
+
+                result = resp.json()
+
+                # Check if rate limit reached
+                if result.get("error_code") == 336502:
+                    logger.warning(f"API key {api_key[:6]}... hit rate limit, cooling down for 30 seconds.")
+                    self.key_cooldown[api_key] = time.time() + random.uniform(30, 40)
+                    time.sleep(2 + attempt)  # exponential backoff
+                    continue
+
+                llm_response = result.get("result") or result.get("result_text") or result.get("output") or ""
+                if not llm_response:
+                    logger.warning(f"Empty response: {result}")
+                return llm_response
+
+            except Exception as e:
+                logger.error(f"Error during {self.model_id}@{self.api_url}: {e}")
+                time.sleep(2 ** attempt + random.uniform(0, 1))
+
+        logger.error(f"judge() failed after {max_retries} retries")
+        return ""
+
     def judge(
         self,
         prompt: str = '',
@@ -127,6 +249,9 @@ class LLMJudge:
         Returns:
             str: The response from the LLM
         """
+        if os.environ.get('MODELSCOPE_USE_ERNIE_JUDGE', '1') == '1':
+            return self.ernie_judge(prompt, system_prompt, messages)
+
         # parse messages
         if messages is not None:
             input_messages = messages
